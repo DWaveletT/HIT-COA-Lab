@@ -79,7 +79,7 @@ PASS! You have done well!
 跑得还挺快。
 
 
-### Lab 2
+### Lab 3
 
 下有文件夹 full-task，实现的 Cache 具有属下参数：
 
