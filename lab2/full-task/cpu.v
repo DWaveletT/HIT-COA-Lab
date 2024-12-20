@@ -67,49 +67,42 @@ module cpu(
     wire do_jump;
     // ==============================
 
-    initial begin
-        IF_ID_PC = -4;
-    end
+    // ========== 分支预测 ===========
+
+    wire[31:0] nPC;
+    reg[65:0] BBT[63:0];
+    // [31:00]: old PC
+    // [63:32]: new PC
+    // [65:64]: status (00 / 01 / 10 / 11)
+    
+    wire ID_jump_inst = (IF_ID_IR[31:26] == 6'b111111 || IF_ID_IR[31:26] == 6'b000010);     // 是跳转指令
+    wire EX_jump_inst = is_jump;                                                            // 是跳转指令
+    
+    wire[5:0] bbt_if_id = IF_ID_PC[7:2];
+
+    wire predict_success =
+        ID_jump_inst && BBT[bbt_if_id][31: 0] == IF_ID_PC && (
+            BBT[bbt_if_id][65:64] == 2'b11 ||
+            BBT[bbt_if_id][65:64] == 2'b10
+        );
+
+    assign nPC = jump_test ? jump_address : ( predict_success ? BBT[bbt_if_id][63:32] : IF_ID_PC + 4 );
+
+    // ==============================
 
     // ============ IF ==============
-    wire[31:0] nPC;
 
     assign inst_sram_en   = !stall && resetn;
     assign inst_sram_addr = nPC;
 
-    my_predictor my_predictor(
-        .clk(clk),
-        .rst(rst),
-
-        .is_jump(is_jump),
-        .do_jump(do_jump),
-        .jump_test(jump_test),
-        .jump_address(jump_address),
-
-        .ID_IR(IF_ID_IR),
-        .EX_IR(ID_EX_IR),
-        .ID_PC(IF_ID_PC),
-        .EX_PC(ID_EX_PC),
-        .nPC(nPC)
-    );
     /*
         根据当前处于 ID 阶段的 IR 和 PC 值，预测下一个 PC 值。
-        因为我们要榨干 CPU 的效率，于是在取得 IR 的时钟沿我们就得立即计算下一条指令
-        的地址并且装进 inst_sram_addr 里面。于是 nPC 只能是组合逻辑实现。
-        然而一开始的 inst_sram_addr 必须要为 0，IF_ID 里啥也没装所以不应该据此计算
-        nPC。
-        于是我们干脆把 IF_ID_PC 初始值赋值为 -4 算了。
     */
 
-    assign IF_ID_IR = {32{resetn}} & inst_sram_rdata;
-    assign IF_ID_JP = {32{resetn}} & nPC;
-    assign IF_ID_NP = {32{resetn}} & (IF_ID_PC + 4);
+    assign IF_ID_IR = inst_sram_rdata;
+    assign IF_ID_JP = nPC;
+    assign IF_ID_NP = (IF_ID_PC + 4);
 
-    always @(posedge clk) begin
-        if(!stall) begin    // 没有冲突信号再读取下一条
-            IF_ID_PC <= resetn ? nPC : -4;
-        end
-    end
     // ==============================
 
     // ============ ID ==============
@@ -135,16 +128,10 @@ module cpu(
     wire[31:0] regfile_rdata1;
     wire[31:0] regfile_rdata2;
 
-    my_regfile my_regfile(
-        .clk   (clk),
-        .we    (we),
-        .raddr1(IF_ID_IR[25:21]),
-        .raddr2(IF_ID_IR[20:16]),
-        .waddr (waddr),
-        .wdata (wdata),
-        .rdata1(regfile_rdata1),
-        .rdata2(regfile_rdata2)
-    );
+    reg [31:0] data[0:31];
+    assign regfile_rdata1 = waddr == IF_ID_IR[25:21] ? wdata : data[IF_ID_IR[25:21]];
+    assign regfile_rdata2 = waddr == IF_ID_IR[20:16] ? wdata : data[IF_ID_IR[20:16]];
+
     // 每个上升沿读入数据到 ID_EX.R1 和 ID_EX.R2 里
 
     wire[31:0] extend_imm;
@@ -153,23 +140,6 @@ module cpu(
         .B     (extend_imm)
     );
 
-    always @(posedge clk) begin
-        ID_EX_NP <= {32{resetn}} & IF_ID_NP;
-        ID_EX_PC <= {32{resetn}} & IF_ID_PC;
-        if (stall) begin    // 如果有冲突信号，先往后传 NOP
-            ID_EX_IR <= 0;
-            ID_EX_R1 <= 0;
-            ID_EX_R2 <= 0;
-            ID_EX_JP <= 0;
-            ID_EX_IM <= 0;
-        end else begin
-            ID_EX_R1 <= {32{resetn & !jump_test}} & regfile_rdata1;
-            ID_EX_R2 <= {32{resetn & !jump_test}} & regfile_rdata2;
-            ID_EX_IR <= {32{resetn & !jump_test}} & IF_ID_IR;
-            ID_EX_JP <= {32{resetn & !jump_test}} & IF_ID_JP;
-            ID_EX_IM <= {32{resetn & !jump_test}} & extend_imm;
-        end
-    end
     // ==============================
 
     // ============ EX ==============
@@ -190,24 +160,16 @@ module cpu(
 
     wire mux1_select, mux2_select;
 
-    my_mux EX_MUX1(
-        .d0(ID_EX_NP),
-        .d1(reg_a),
-        .select(mux1_select),
-        .out(alu_a)
-    );  // 从 PC 和 R1 里选一个
+    assign alu_a = mux1_select ? reg_a : ID_EX_NP;
+
     assign mux1_select =
         (ID_EX_IR[31:26] == 6'b000000) |    // 运算指令需要 R1
         (ID_EX_IR[31:26] == 6'b101011) |    // 存数指令需要 R1
         (ID_EX_IR[31:26] == 6'b100011) |    // 取数指令需要 R1
         (ID_EX_IR[31:26] == 6'b111110);
 
-    my_mux EX_MUX2(
-        .d0(ID_EX_IM),
-        .d1(reg_b),
-        .select(mux2_select),
-        .out(alu_b)
-    );  // 从 R2 和 IM 里选一个
+    assign alu_b = mux2_select ? reg_b : ID_EX_IM;
+
     assign mux2_select =
         (ID_EX_IR[31:26] == 6'b000000) |    // 运算指令需要 R2
         (ID_EX_IR[31:26] == 6'b111110);     // 比较指令需要 R2
@@ -243,21 +205,6 @@ module cpu(
     assign jump_test = is_jump && (jump_address != ID_EX_JP);
         // 如果跳转地址和实际地址不同，则预测不符，需要清空 ID 里的指令
 
-    always @(posedge clk) begin
-        EX_MEM_RG <= {32{resetn}} & reg_b;
-        EX_MEM_IR <= {32{resetn}} & (
-            {32{!(ID_EX_IR[31:26] == 6'b000000 && ID_EX_IR[5:0] == 6'b001010 && reg_b != 0)}}
-        ) & ID_EX_IR;
-            // 如果是 MOVZ 指令并且 R2 为 0 就不继续执行
-        EX_MEM_RS <= {32{resetn}} & (
-            ({32{ID_EX_IR[31:26] == 6'b000000}} & alu_result) |  // 运算指令使用 ALU
-            ({32{ID_EX_IR[31:26] == 6'b100011}} & alu_result) |  // 取数指令使用 ALU
-            ({32{ID_EX_IR[31:26] == 6'b101011}} & alu_result) |  // 存数指令使用 ALU
-            ({32{ID_EX_IR[31:26] == 6'b111110}} & alu_result)    // 比较指令使用 ALU
-        );
-
-        EX_MEM_PC <= {32{resetn}} & ID_EX_PC;
-    end
     // ==============================
 
     // =========== MEM ==============
@@ -268,26 +215,16 @@ module cpu(
         (EX_MEM_IR[31:26] == 6'b100011) |       // 取数指令访存
         (EX_MEM_IR[31:26] == 6'b101011);        // 存数指令访存
     
-    assign MEM_WB_MM = {32{resetn}} & data_sram_rdata;
+    assign MEM_WB_MM = data_sram_rdata;
     // 在下个上升沿才能从 SRAM 里面读出数据
         
-    always @(posedge clk) begin
-        MEM_WB_IR <= {32{resetn}} & EX_MEM_IR;
-        MEM_WB_RS <= {32{resetn}} & EX_MEM_RS;
-        
-        MEM_WB_PC <= {32{resetn}} & EX_MEM_PC;
-    end
     // ==============================
 
     // ============ WB ==============
     wire mux3_select;
 
-    my_mux WB_MUX(
-        .d0(MEM_WB_RS),         // 读结果
-        .d1(MEM_WB_MM),         // 读内存
-        .select(mux3_select),
-        .out(wdata)
-    );
+    assign wdata = mux3_select ? MEM_WB_MM : MEM_WB_RS;
+
     assign waddr =
         ({32{MEM_WB_IR[31:26] == 6'b100011}} & MEM_WB_IR[20:16]) |  // 取数指令写回 IR[20:16]
         ({32{MEM_WB_IR[31:26] == 6'b000000}} & MEM_WB_IR[15:11]) |  // 运算指令写回 IR[15:11]
@@ -305,5 +242,111 @@ module cpu(
     assign debug_wb_rf_wen   = we;          // 写回使能
     assign debug_wb_rf_wnum  = waddr;       // 写回地址
     assign debug_wb_rf_wdata = wdata;       // 写回数据
+
+    wire[5:0] bbt_id_ex = ID_EX_PC[7:2];
+
+    // genvar i;
+    // generate
+    //     for(i = 0;i < 64;i = i + 1) begin
+    //         always @(posedge clk) begin
+    //             if(~resetn)
+    //                 BBT[i] <= 0;
+    //         end
+    //     end
+    //     for(i = 0;i < 32;i = i + 1) begin
+    //         always @(posedge clk) begin
+    //             if(~resetn)
+    //                 data[i] <= 0;
+    //         end
+    //     end
+    // endgenerate
+
+    integer i;
+    // ==============================
+    always @(posedge clk) begin
+        if(~resetn) begin
+            IF_ID_PC <= -4;
+
+            ID_EX_NP <= 0;
+            ID_EX_IR <= 0;
+            ID_EX_R1 <= 0;
+            ID_EX_R2 <= 0;
+            ID_EX_IM <= 0;
+            ID_EX_JP <= 0;
+            ID_EX_PC <= 0;
+
+            EX_MEM_RS <= 0;
+            EX_MEM_RG <= 0;
+            EX_MEM_IR <= 0;
+            EX_MEM_PC <= 0;
+
+            MEM_WB_RS <= 0;
+            MEM_WB_IR <= 0;
+            MEM_WB_PC <= 0;
+
+            for(i = 0;i < 32;i = i + 1) begin
+                data[i] <= 0;
+            end
+            for(i = 0;i < 64;i = i + 1) begin
+                BBT[i] <= 0;
+            end
+        end else begin
+            if(we) begin
+                data[waddr] <= wdata;
+            end
+            if(EX_jump_inst) begin                   // 根据 EX 内的指令更新表
+                if(BBT[bbt_id_ex][31: 0] != ID_EX_PC) begin   // 第一次碰到，初始化
+                    BBT[bbt_id_ex][31: 0] <= ID_EX_PC;
+                    BBT[bbt_id_ex][63:32] <= jump_address;
+                    BBT[bbt_id_ex][65:64] <= 2'b00;        // 初始默认失败
+                end else begin
+                    if(!do_jump) begin                      // 跳转失败
+                        case (BBT[bbt_id_ex][65:64])
+                            // 2'b00: BBT[bbt_id_ex][65:64] <= 2'b00;
+                            2'b01: BBT[bbt_id_ex][65:64] <= 2'b00;
+                            2'b10: BBT[bbt_id_ex][65:64] <= 2'b01;
+                            2'b11: BBT[bbt_id_ex][65:64] <= 2'b10;
+                        endcase
+                        BBT[bbt_id_ex][63:32] <= jump_address;
+                                            // 更新正确的跳转地址
+                    end else begin                          // 跳转成功
+                        case (BBT[bbt_id_ex][65:64])
+                            2'b00: BBT[bbt_id_ex][65:64] <= 2'b01;
+                            2'b01: BBT[bbt_id_ex][65:64] <= 2'b10;
+                            2'b10: BBT[bbt_id_ex][65:64] <= 2'b11;
+                            // 2'b11: BBT[bbt_id_ex][65:64] <= 2'b11;
+                        endcase
+                    end
+                end
+            end
+
+            ID_EX_NP <= IF_ID_NP;
+            ID_EX_PC <= IF_ID_PC;
+            
+            // 如果有冲突信号，先往后传 NOP
+            IF_ID_PC <= stall ? IF_ID_PC : nPC;
+            ID_EX_R1 <= {32{!jump_test && !stall}} & regfile_rdata1;
+            ID_EX_R2 <= {32{!jump_test && !stall}} & regfile_rdata2;
+            ID_EX_IR <= {32{!jump_test && !stall}} & IF_ID_IR;
+            ID_EX_JP <= {32{!jump_test && !stall}} & IF_ID_JP;
+            ID_EX_IM <= {32{!jump_test && !stall}} & extend_imm;
+
+            EX_MEM_RG <= reg_b;
+            EX_MEM_IR <= (
+                {32{!(ID_EX_IR[31:26] == 6'b000000 && ID_EX_IR[5:0] == 6'b001010 && reg_b != 0)}}
+            ) & ID_EX_IR;
+                // 如果是 MOVZ 指令并且 R2 为 0 就不继续执行
+            EX_MEM_RS <= (
+                ({32{ID_EX_IR[31:26] == 6'b000000}} & alu_result) |  // 运算指令使用 ALU
+                ({32{ID_EX_IR[31:26] == 6'b100011}} & alu_result) |  // 取数指令使用 ALU
+                ({32{ID_EX_IR[31:26] == 6'b101011}} & alu_result) |  // 存数指令使用 ALU
+                ({32{ID_EX_IR[31:26] == 6'b111110}} & alu_result)    // 比较指令使用 ALU
+            );
+            EX_MEM_PC <= ID_EX_PC;
+            MEM_WB_IR <= EX_MEM_IR;
+            MEM_WB_RS <= EX_MEM_RS;
+            MEM_WB_PC <= EX_MEM_PC;
+        end
+    end
 
 endmodule

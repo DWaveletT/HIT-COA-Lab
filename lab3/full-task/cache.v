@@ -22,13 +22,6 @@ module cache (
     output reg        rready            //标识当前的 Cache 已经准备好可以接收主存返回的数据
 );
 
-    always @(posedge clk && ~resetn) begin
-        cache_data_ok <= 0;
-
-        arvalid <= 0;
-        rready  <= 0;
-    end
-
     // ======= IF1/IF2 =========
     
     wire[31:0] way0_rdata;
@@ -41,20 +34,6 @@ module cache (
     reg        way1_replace;
     reg[31:0]  req_addr;
     reg        flag, get;
-
-    always @(posedge clk) begin
-        if(~resetn) begin
-            way0_tag <= 0;
-            way1_tag <= 0;
-            way0_valid <= 0;
-            way1_valid <= 0;
-            way0_replace <= 0;
-            way1_replace <= 0;
-            req_addr <= 0;
-            flag <= 0;
-            get  <= 0;
-        end
-    end
 
     // =========================
 
@@ -71,11 +50,6 @@ module cache (
     reg[9:0]   ram1_waddr;
     reg[31:0]  ram1_wdata;
     reg[0:0]   ram1_wen;
-
-    always @(posedge clk && ~resetn) begin
-        ram0_wen <= 0;
-        ram1_wen <= 0;
-    end
 
     blk_mem_gen_0 ram0(
         .clka(clk),
@@ -136,46 +110,18 @@ module cache (
 
     wire hit0, hit1;
     reg  finish;
-    always @(posedge clk) begin
-        if(~resetn)
-            finish <= 0;
-    end
 
     assign stall = flag && (~hit0 && ~hit1 && ~finish);
 
     // ========== IF1 ==========
 
     assign cache_addr_ok = ~stall && resetn;
-    always @(posedge clk) begin
-        // $display("Tick");
-
-        if(~stall && resetn) begin
-            way0_tag     <= tags0[ind][19:0];
-            way1_tag     <= tags1[ind][19:0];
-            way0_valid   <= tags0[ind][20];
-            way1_valid   <= tags1[ind][20];
-            way0_replace <= tags0[ind][21];
-            way1_replace <= tags1[ind][21];
-            req_addr     <= cpu_addr;
-            flag         <= 1;
-            
-            // $display("Read %h form ram0[%h]: ", way0_rdata, ram0_raddr );
-            // $display("Read %h form ram1[%h]: ", way1_rdata, ram1_raddr );
-            
-            // $display("Get way0: tag = %h, valid = %d, replace = %d", tags0[ind][19:0], tags0[ind][20], tags0[ind][21] );
-            // $display("Get way1: tag = %h, valid = %d, replace = %d", tags1[ind][19:0], tags1[ind][20], tags1[ind][21] );
-        end
-    end
 
     // =========================
 
     // ========== IF2 ==========
 
     reg[2:0] state;         // CPU 与主存数据通信时的状态
-    always @(posedge clk) begin
-        if(~resetn)
-            state <= 0;
-    end
 
     wire[19:0] req_tag;
     wire[ 6:0] req_ind;
@@ -193,94 +139,115 @@ module cache (
     wire[9:0] nram1_waddr = ram1_waddr + 1;
 
     always @(posedge clk) begin
-        if(flag && resetn) begin
-            // $display("Address = %h, State = %d, hit0 = %d, hit1 = %d", req_addr, state, hit0, hit1);
+		if(resetn) begin
+			if(~stall) begin
+				way0_tag     <= tags0[ind][19:0];
+				way1_tag     <= tags1[ind][19:0];
+				way0_valid   <= tags0[ind][20];
+				way1_valid   <= tags1[ind][20];
+				way0_replace <= tags0[ind][21];
+				way1_replace <= tags1[ind][21];
+				req_addr     <= cpu_addr;
+				flag         <= 1;
+			end
+			if(flag) begin
+				case (state)
+					0: begin    // 开始向 AR 请求数据
 
-            case (state)
-                0: begin    // 开始向 AR 请求数据
+						if(hit0 || hit1) begin       // 命中
+							cache_data_ok <= 1;
+							cache_rdata   <= hit0 ? way0_rdata : way1_rdata;
 
-                    if(hit0 || hit1) begin       // 命中
-                        cache_data_ok <= 1;
-                        cache_rdata   <= hit0 ? way0_rdata : way1_rdata;
+							// 更新替换标记位
+							tags0[req_ind][21] = hit1;
+							tags1[req_ind][21] = hit0;
+						end else begin              // 未命中
+							arvalid <= 1;
+							araddr  <= { req_tag, req_ind, 5'b00000 };
+							arid    <= 0;
 
-                        // 更新替换标记位
-                        tags0[req_ind][21] = hit1;
-                        tags1[req_ind][21] = hit0;
-                    end else begin              // 未命中
-                        arvalid <= 1;
-                        araddr  <= { req_tag, req_ind, 5'b00000 };
-                        arid    <= 0;
+							cache_data_ok <= 0;     // 告诉 CPU 数据还没准备好
 
-                        cache_data_ok <= 0;     // 告诉 CPU 数据还没准备好
+							if(override) begin  // 写入 1 路
+								ram1_waddr <= { req_ind, 3'b000 } - 1;
+								tags1[req_ind] <= { 1'b0, 1'b1, req_tag };
+							end else begin      // 写入 0 路
+								ram0_waddr <= { req_ind, 3'b000 } - 1;
+								tags0[req_ind] <= { 1'b0, 1'b1, req_tag };
+							end
 
-                        if(override) begin  // 写入 1 路
-                            ram1_waddr <= { req_ind, 3'b000 } - 1;
-                            tags1[req_ind] <= { 1'b0, 1'b1, req_tag };
+							state <= 1;         // 进入地址握手状态
+						end
+					end
+					1: begin
+						if(arready) begin   // 握手成功，进入数据握手状态
+							arvalid <= 0;
+							rready  <= 1;
+							state   <= 2;
+						end
+					end
+					2: begin
+						if(rvalid) begin
+							if(override) begin      // 替换 1 路
+								ram1_wen <= 1;
+								ram1_wdata <= rdata;
+								ram1_waddr <= nram1_waddr;
 
-                            // $display("Write %d, %d, %h into tags1: ", 0, 1, req_tag );
-                        end else begin      // 写入 0 路
-                            ram0_waddr <= { req_ind, 3'b000 } - 1;
-                            tags0[req_ind] <= { 1'b0, 1'b1, req_tag };
+								if(nram1_waddr == { req_ind, req_off[ 4: 2] } ) begin
+									cache_rdata <= rdata;
+								end
+							end else begin          // 替换 0 路
+								ram0_wen <= 1;
+								ram0_wdata <= rdata;
+								ram0_waddr <= nram0_waddr;
+								
+								if(nram0_waddr == { req_ind, req_off[ 4: 2] } ) begin
+									cache_rdata <= rdata;
+								end
+							end
 
-                            // $display("Write %d, %d, %h into tags0: ", 0, 1, req_tag );
-                        end
+							if(rlast) begin // 数据传输完毕
+								rready <= 0;
+								state  <= 3;
 
-                        state <= 1;         // 进入地址握手状态
-                    end
-                end
-                1: begin
-                    if(arready) begin   // 握手成功，进入数据握手状态
-                        arvalid <= 0;
-                        rready  <= 1;
-                        state   <= 2;
-                    end
-                end
-                2: begin
-                    if(rvalid) begin
-                        if(override) begin      // 替换 1 路
-                            ram1_wen <= 1;
-                            ram1_wdata <= rdata;
-                            ram1_waddr <= nram1_waddr;
-                            
-                            // $display("Write %h into ram1[%h]: ", rdata, nram1_waddr );
+							end
+						end
+					end
+					3: begin                // 花一帧时间等待 RAM 写入完毕
+						ram0_wen <= 0;
+						ram1_wen <= 0;
+						finish <= 1;
 
-                            if(nram1_waddr == { req_ind, req_off[ 4: 2] } ) begin
-                                cache_rdata <= rdata;
-                            end
-                        end else begin          // 替换 0 路
-                            ram0_wen <= 1;
-                            ram0_wdata <= rdata;
-                            ram0_waddr <= nram0_waddr;
-                            
-                            // $display("Write %h into ram0[%h]: ", rdata, nram0_waddr );
-                            
-                            if(nram0_waddr == { req_ind, req_off[ 4: 2] } ) begin
-                                cache_rdata <= rdata;
-                            end
-                        end
+						state <= 4;
+					end
+					4: begin                // 花一帧时间等待 RAM 读取地址 
+						cache_data_ok <= 1;
+						finish <= 0;
 
-                        if(rlast) begin // 数据传输完毕
-                            rready <= 0;
-                            state  <= 3;
+						state <= 0;
+					end
+				endcase
+			end
+		end else begin
+			cache_data_ok <= 0;
+			arvalid <= 0;
+			rready  <= 0;
+			way0_tag <= 0;
+			way1_tag <= 0;
+			way0_valid <= 0;
+			way1_valid <= 0;
+			way0_replace <= 0;
+			way1_replace <= 0;
+			req_addr <= 0;
+			flag <= 0;
+			get  <= 0;
 
-                        end
-                    end
-                end
-                3: begin                // 花一帧时间等待 RAM 写入完毕
-                    ram0_wen <= 0;
-                    ram1_wen <= 0;
-                    finish <= 1;
+			ram0_wen <= 0;
+			ram1_wen <= 0;
 
-                    state <= 4;
-                end
-                4: begin                // 花一帧时间等待 RAM 读取地址 
-                    cache_data_ok <= 1;
-                    finish <= 0;
-
-                    state <= 0;
-                end
-            endcase
-        end
+			finish <= 0;
+			state <= 0;
+		end
     end
     // =========================
 

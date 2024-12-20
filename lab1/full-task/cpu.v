@@ -57,8 +57,8 @@ module cpu(
     // ==============================
 
     // ========== MEM_WB ============
-    reg[31:0] MEM_WB_RS;
-    reg[31:0] MEM_WB_IR;
+    reg[31:0]  MEM_WB_RS;
+    reg[31:0]  MEM_WB_IR;
     wire[31:0] MEM_WB_MM;
 
     reg[31:0] debug_MEM_WB_PC;      // 测试用
